@@ -166,6 +166,22 @@ control tick is written as one timestamped CSV row for offline analysis.
   strategies on identical inputs, **compile CI**, and a **statistical analysis**
   with bootstrap confidence intervals.
 
+Optional research modules, each behind an opt-in flag and off by default:
+
+- **Kalman fusion** (`kalman.h`): a 1D Kalman filter that fuses the two arrays
+  using their live variance as the measurement noise, the principled form of the
+  inverse-variance blend.
+- **Learned switching policy** (`policy.h`): a tiny logistic policy trained
+  offline that decides which array to trust, in place of the fixed margin.
+- **Line-loss recovery** (`recovery.h`): coast small gaps and sweep to reacquire
+  the line instead of stopping.
+- **Disagreement detector** (`disagreement.h`): flags line edges, junctions, and
+  anomalies from where the analog and digital reads disagree.
+- **Online recalibration**: adapts each sensor's calibration to changing light
+  while running.
+- **A parameter sweep** with a Pareto frontier, **Monte Carlo** confidence
+  intervals, a **WebAssembly** sim demo, and a one-command **reproduce.sh**.
+
 ## Tech stack
 
 | | Tool | Role |
@@ -240,6 +256,10 @@ Edit the `#define`s at the top of `line_following.ino`. PID gains live in
 | `MIN_BIAS_PWM`, `MAX_BIAS_PWM` | adaptive-speed forward bias band (slow on turns, fast on straights) | `20`, `40` |
 | `MaxTurnPWM` | maximum steering differential | `20` |
 | `USE_SAVED_CALIBRATION` | `1` loads calibration from EEPROM and skips the spin | `0` |
+| `FUSION_USE_KALMAN` | `METHOD_FUSION` uses the Kalman filter instead of the inverse-variance blend | `0` |
+| `SWITCH_USE_POLICY` | `METHOD_SWITCHING` uses the learned policy instead of the fixed margin | `0` |
+| `ENABLE_RECOVERY` | handle line loss with coast/search recovery instead of stopping | `0` |
+| `LOG_DISAGREEMENT` | compute the analog/digital disagreement each tick and add a CSV column | `0` |
 | `MAX_RESULTS` | logged control ticks per trial | `80` |
 | `ANALOG_STOP_SUM`, `DIGITAL_STOP_SUM` | end-of-line thresholds | `0.4`, `0.1` |
 | `DEBUG_INSPECT` | `1` streams calibrated readings and variance forever (tuning) | `0` |
@@ -339,6 +359,16 @@ cd sim && make run
 This is the apples-to-apples comparison the physical runs could not give. On the
 synthetic track, fusion produces the smoothest steering while tracking nearly as
 tightly as digital, and the debounce holds the switch to a modest rate.
+`cd sim && make sweep` then `python analysis/pareto.py` sweeps the switch margin
+and dwell over many seeds and plots the tracking-vs-smoothness Pareto frontier;
+the best region is a low dwell (1 to 2 ticks) with a margin near 0.001 to 0.002.
+
+To rebuild and re-verify everything (host tests, sim, and every figure and stat)
+in one command:
+
+```bash
+bash reproduce.sh
+```
 
 ## Project structure
 
@@ -348,9 +378,13 @@ bifocal/
 │   ├── line_following/            # main Arduino sketch (open this folder in the IDE)
 │   │   ├── line_following.ino      #   loop, strategy dispatch, adaptive speed, serial CLI, logger
 │   │   ├── steering.h              #   5-sensor line position, 2-sensor fallback, PID_c
-│   │   ├── analoglinesensors.h     #   AnalogLineSensors_c (analog pipeline, rolling variance, filters)
-│   │   ├── digitallinesensors.h    #   DigitalLineSensors_c (RC decay pipeline, rolling variance, filters)
+│   │   ├── analoglinesensors.h     #   AnalogLineSensors_c (rolling variance, filters, online recal)
+│   │   ├── digitallinesensors.h    #   DigitalLineSensors_c (rolling variance, filters, online recal)
 │   │   ├── persistence.h           #   EEPROM calibration save/load
+│   │   ├── kalman.h                #   1D Kalman line-position fusion (opt-in)
+│   │   ├── policy.h                #   learned logistic switching policy (opt-in)
+│   │   ├── recovery.h              #   line-loss coast/search recovery (opt-in)
+│   │   ├── disagreement.h          #   analog/digital disagreement detector (opt-in)
 │   │   ├── motors.h                #   Motors_c (PWM and direction)
 │   │   ├── encoders.h              #   quadrature encoder ISRs (AVR register-level)
 │   │   └── kinematics.h            #   Kinematics_c (configurable differential-drive odometry)
@@ -363,19 +397,18 @@ bifocal/
 │   ├── RT_Results.ipynb           # exploratory notebook (pandas, seaborn)
 │   ├── make_gallery.py            # regenerates the main gallery figures
 │   ├── sensor_noise.py            # middle-sensor noise investigation
-│   └── statistics.py              # bootstrap CIs and significance tests
-├── sim/                           # offline replay harness (make run), host-only
-├── tests/                         # host unit tests (stubbed Arduino API, make test)
+│   ├── statistics.py              # bootstrap CIs and significance tests
+│   ├── train_policy.py            # trains the learned switching policy
+│   └── pareto.py                  # sweep Pareto frontier and Monte Carlo CIs
+├── sim/                           # offline replay harness + parameter sweep (make run / make sweep)
+├── tests/                         # host unit tests, six suites (make test)
+├── web/                           # WebAssembly sim demo (build with emscripten)
 ├── gallery/                       # generated figures (checked in)
-├── docs/
-│   ├── variance-based-sensor-switching-paper.pdf
-│   ├── addendum.md                #   what changed since the paper
-│   ├── odometry-calibration.md
-│   ├── sensor-noise.md
-│   ├── statistics.md
-│   └── build-and-ci.md
+├── docs/                          # paper, addendum, and per-feature notes
 ├── assets/logos/                  # tech-stack logos used by this README
 ├── .github/workflows/ci.yml       # compile CI (arduino-cli + PlatformIO)
+├── reproduce.sh                   # one-command build + test + figures
+├── Dockerfile
 ├── platformio.ini
 ├── AUTHORS
 ├── CONTRIBUTING.md
@@ -418,9 +451,16 @@ The original study's roadmap is now implemented in firmware and tooling:
   heading formula was corrected during the refactor.
 - **Data.** Clean, fixed-rate, timestamped CSV logging, and EEPROM calibration
   persistence.
-- **Tooling.** A PlatformIO project, compile CI, host unit tests, an offline
-  replay simulation ([sim/](sim/)), and a statistical re-analysis with bootstrap
-  confidence intervals ([docs/statistics.md](docs/statistics.md)).
+- **Tooling.** A PlatformIO project, compile CI, host unit tests (six suites), an
+  offline replay simulation with a parameter sweep and Pareto frontier
+  ([sim/](sim/), [docs/parameter-sweep.md](docs/parameter-sweep.md)), a
+  statistical re-analysis with bootstrap confidence intervals
+  ([docs/statistics.md](docs/statistics.md)), a WebAssembly demo ([web/](web/)),
+  and a one-command reproduce script.
+- **Research modules (opt-in).** Kalman line-position fusion, a learned logistic
+  switching policy, line-loss recovery, disagreement-based feature detection, and
+  online recalibration. Each is off by default and host-tested; flip its flag in
+  the sketch to try it.
 
 Still open, because it needs the physical robot: tune the PID gains and the
 switch margin and dwell on the track, and collect more and longer clean-CSV runs
