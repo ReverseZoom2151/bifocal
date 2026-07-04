@@ -4,6 +4,10 @@
 // Number of samples used per variance estimate.
 #define D_MAX_SAMPLES 10
 
+// Default smoothing factor for the optional EMA low-pass filter on calibrated
+// readings. Range 0..1: higher tracks faster, lower smooths harder.
+#define D_FILTER_ALPHA 0.4
+
 // IR emitter and the 5 line-sensor pins in RC-discharge (digital) mode.
 // NOTE: these macros are D_-prefixed so they cannot collide with the analog
 // header when both are included in the same sketch (the original code reused
@@ -30,12 +34,28 @@ class DigitalLineSensors_c {
     float offset[5];
     float scale[5];
 
+    // Optional EMA low-pass filter state. filter_valid seeds filtered[] with
+    // the first calibrated reading (instead of 0) to avoid a startup ramp.
+    float filter_alpha = D_FILTER_ALPHA;
+    bool  filter_valid = false;
+
   public:
 
     float calibrated[5];
+    float filtered[5];       // EMA-smoothed readings after getFiltered()
     float variance[5];
 
+    // When true, getCalibrated() also updates filtered[] (opt-in). Default off
+    // so behaviour is byte-identical to the unfiltered pipeline.
+    bool  useFilter = false;
+
     DigitalLineSensors_c() {}
+
+    // Set the EMA smoothing factor (0..1). Higher tracks faster, lower smooths
+    // harder. Out-of-range values are ignored.
+    void setFilterAlpha(float alpha) {
+      if (alpha >= 0.0 && alpha <= 1.0) filter_alpha = alpha;
+    }
 
     // Read all sensors in parallel by charging the capacitors HIGH, releasing
     // them to INPUT, and timing each pin's fall to LOW. Result (microseconds)
@@ -118,11 +138,51 @@ class DigitalLineSensors_c {
         calibrated[i] = ((float)sensorReadings[i] - offset[i]) * scale[i];
       }
 
+      if (useFilter) updateFilter();
+
+    }
+
+    // Update the EMA filter from the current calibrated[] values. On first use
+    // filtered[] is seeded with calibrated[] to avoid ramping up from 0.
+    void updateFilter() {
+
+      if (!filter_valid) {
+        for (int i = 0; i < 5; i++) {
+          filtered[i] = calibrated[i];
+        }
+        filter_valid = true;
+        return;
+      }
+
+      for (int i = 0; i < 5; i++) {
+        filtered[i] = filter_alpha * calibrated[i]
+                    + (1.0 - filter_alpha) * filtered[i];
+      }
+
+    }
+
+    // Take a fresh reading and return the EMA-smoothed result in filtered[].
+    // Opt-in low-pass path; leaves the calibrated[] contract unchanged. The
+    // useFilter flag is bypassed here so the EMA is stepped exactly once.
+    void getFiltered() {
+      bool prev = useFilter;
+      useFilter = false;
+      getCalibrated();
+      useFilter = prev;
+      updateFilter();
     }
 
     void printCalibrated() {
       for (int i = 0; i < 5; i++) {
         Serial.print(calibrated[i]);
+        Serial.print(",");
+      }
+      Serial.print("\n");
+    }
+
+    void printFiltered() {
+      for (int i = 0; i < 5; i++) {
+        Serial.print(filtered[i]);
         Serial.print(",");
       }
       Serial.print("\n");
