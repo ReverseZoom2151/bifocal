@@ -15,10 +15,13 @@ class Kinematics_c {
     long lastRightEncoderCount = 0;
 
     // Pololu 3Pi+ geometry. These are nominal values -- calibrate for accuracy.
-    const float wheelRadius   = 16.5;   // wheel RADIUS in mm (~33 mm diameter)
-    const float wheelSeparation = 42.5; // distance between wheel contact points, mm
-    const float encoderCountsPerRevolution = 358.3;
-    const float mmPerCount = (2.0 * PI * wheelRadius) / encoderCountsPerRevolution;
+    // They are no longer const so setGeometry() can override them at runtime
+    // after an empirical calibration (see docs/odometry-calibration.md). The
+    // defaults below keep the original behaviour unchanged if nothing is set.
+    float wheelRadius   = 16.5;   // wheel RADIUS in mm (~33 mm diameter)
+    float wheelSeparation = 42.5; // distance between wheel contact points, mm
+    float encoderCountsPerRevolution = 358.3;
+    float mmPerCount = (2.0 * PI * wheelRadius) / encoderCountsPerRevolution;
 
     // Rolling log of recent theta values (circular buffer).
     float thetaLog[THETA_LOG_SIZE];
@@ -31,6 +34,37 @@ class Kinematics_c {
     int currentIndex = 0;
 
     Kinematics_c() {}
+
+    // Override the physical geometry with calibrated values and recompute the
+    // derived mmPerCount factor. Call this once from setup() after measuring the
+    // robot against ground truth (see docs/odometry-calibration.md). Passing the
+    // nominal numbers reproduces the default behaviour exactly.
+    void setGeometry(float newWheelRadius, float newWheelSeparation, float newCountsPerRev) {
+      wheelRadius   = newWheelRadius;
+      wheelSeparation = newWheelSeparation;
+      encoderCountsPerRevolution = newCountsPerRev;
+      mmPerCount = (2.0 * PI * wheelRadius) / encoderCountsPerRevolution;
+    }
+
+    // Accessors for the current geometry, in case a caller wants to read a value
+    // back rather than assume the default.
+    float getWheelRadius()     { return wheelRadius; }
+    float getWheelSeparation() { return wheelSeparation; }
+    float getCountsPerRev()    { return encoderCountsPerRevolution; }
+    float getMmPerCount()      { return mmPerCount; }
+
+    // Print the current geometry over serial as a labelled row, handy for
+    // confirming which values the firmware is actually using.
+    void printGeometry() {
+      Serial.print("wheelRadius(mm)=");
+      Serial.print(wheelRadius);
+      Serial.print(" wheelSeparation(mm)=");
+      Serial.print(wheelSeparation);
+      Serial.print(" countsPerRev=");
+      Serial.print(encoderCountsPerRevolution);
+      Serial.print(" mmPerCount=");
+      Serial.println(mmPerCount);
+    }
 
     // Print the theta history collected so far (CSV row).
     void printTheta() {
