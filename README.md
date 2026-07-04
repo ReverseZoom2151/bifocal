@@ -31,9 +31,10 @@ optional filtering, clean logging, host tests, and compile CI.
 
 ## Gallery
 
-The first three figures come from [`analysis/make_gallery.py`](analysis/make_gallery.py);
-the fourth comes from [`analysis/sensor_noise.py`](analysis/sensor_noise.py). All
-are generated from the raw trial CSVs in `data/`. No values are entered by hand.
+The figures come from [`analysis/make_gallery.py`](analysis/make_gallery.py),
+[`analysis/sensor_noise.py`](analysis/sensor_noise.py), and
+[`analysis/statistics.py`](analysis/statistics.py). All are generated from the raw
+trial CSVs in `data/`. No values are entered by hand.
 
 <table>
 <tr>
@@ -43,6 +44,9 @@ are generated from the raw trial CSVs in `data/`. No values are entered by hand.
 <tr>
 <td align="center"><img src="gallery/calibration_contrast.png" width="300"><br><sub><b>Calibration contrast</b>: the line reads as a peak on sensor 2; digital's floor is tighter</sub></td>
 <td align="center"><img src="gallery/sensor_noise.png" width="300"><br><sub><b>Middle-sensor noise</b>: sensor 2 is noisiest under switching, inherited from the digital branch</sub></td>
+</tr>
+<tr>
+<td align="center" colspan="2"><img src="gallery/statistics.png" width="600"><br><sub><b>Statistics</b>: average variance with 95% bootstrap confidence intervals, and switching-vs-baseline differences</sub></td>
 </tr>
 </table>
 
@@ -145,14 +149,22 @@ control tick is written as one timestamped CSV row for offline analysis.
 - **Debounced switching** with a hysteresis margin and a minimum dwell time, to
   stop the per-tick flip-flopping that adds heading wobble.
 - **Inverse-variance fusion** that blends the two arrays instead of hard-picking.
-- **Optional EMA low-pass filter** on calibrated readings, symmetric across both
-  arrays, off by default so the unfiltered pipeline is unchanged.
+- **Non-blocking rolling variance** over a per-sensor ring buffer, so the switch
+  decision no longer stalls the control loop to resample each tick.
+- **Signal conditioning**: an optional EMA low-pass filter, a median-based
+  outlier clamp that rejects lone spikes, and a per-sensor gain trim, all off or
+  neutral by default so the unfiltered pipeline is unchanged.
+- **Adaptive speed** that lowers the forward bias as the steering demand rises,
+  so the robot slows for curves and runs faster on straights.
+- **Live serial tuning** to change method, PID gains, and speed at runtime, plus
+  **EEPROM calibration persistence** so a good calibration survives a reboot.
 - **Configurable odometry geometry** (`setGeometry`) with a standalone
   calibration sketch and a written procedure.
 - **Clean, fixed-rate, timestamped CSV logging**
-  (`t_ms,theta,method,line_error,var_a,var_d`), one row per control tick.
-- **Host unit tests** and **compile CI** (arduino-cli and PlatformIO).
-- **A reproducible analysis pipeline** and the **full experimental dataset**.
+  (`t_ms,theta,method,line_error,var_a,var_d,bias`), one row per control tick.
+- **Host unit tests**, an **offline replay simulation** that compares all four
+  strategies on identical inputs, **compile CI**, and a **statistical analysis**
+  with bootstrap confidence intervals.
 
 ## Tech stack
 
@@ -225,14 +237,20 @@ Edit the `#define`s at the top of `line_following.ino`. PID gains live in
 | `SWITCH_DWELL_MS` | switching: minimum time on an array before switching again | `300` |
 | `FUSION_EPS` | inverse-variance guard so a zero variance cannot dominate | `0.0001` |
 | `CONTROL_PERIOD_MS` | control loop period (also the log rate) | `100` |
-| `BiasPWM` | forward bias PWM | `30` |
+| `MIN_BIAS_PWM`, `MAX_BIAS_PWM` | adaptive-speed forward bias band (slow on turns, fast on straights) | `20`, `40` |
 | `MaxTurnPWM` | maximum steering differential | `20` |
+| `USE_SAVED_CALIBRATION` | `1` loads calibration from EEPROM and skips the spin | `0` |
 | `MAX_RESULTS` | logged control ticks per trial | `80` |
 | `ANALOG_STOP_SUM`, `DIGITAL_STOP_SUM` | end-of-line thresholds | `0.4`, `0.1` |
 | `DEBUG_INSPECT` | `1` streams calibrated readings and variance forever (tuning) | `0` |
 
 Switching between strategies is a one-line change to `FOLLOW_METHOD`. This is how
 the datasets in `data/results/` were produced.
+
+Many of these can also be changed at runtime over serial without recompiling.
+Send `?` for the current settings, `m <0-3>` to pick the method, `p <kp> <ki> <kd>`
+to set PID gains, `s <min> <max>` to set the speed band, and `w` / `l` / `c` to
+save, load, or clear the EEPROM calibration.
 
 ## Experimental method
 
@@ -287,6 +305,7 @@ pip install pandas numpy matplotlib seaborn jupyter
 
 python analysis/make_gallery.py        # regenerate the main gallery figures
 python analysis/sensor_noise.py        # regenerate the middle-sensor figure and stats
+python analysis/statistics.py          # bootstrap CIs and significance tests
 jupyter notebook analysis/RT_Results.ipynb
 ```
 
@@ -304,10 +323,22 @@ cd tests && make test        # builds and runs all suites under g++ -Wall
 ```
 
 The suite stubs the Arduino API (with injectable `analogRead`/`digitalRead`) and
-checks the population-variance formula, the average-variance helper, and the
-differential-drive pose and heading integration. On every push and pull request,
-GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) compiles the
-sketch with both arduino-cli and PlatformIO.
+checks the population-variance formula, the outlier clamp, the average-variance
+helper, and the differential-drive pose and heading integration. On every push
+and pull request, GitHub Actions
+([.github/workflows/ci.yml](.github/workflows/ci.yml)) compiles the sketch with
+both arduino-cli and PlatformIO.
+
+The offline replay harness compares all four strategies on one identical, seeded
+set of synthetic inputs and prints smoothness and tracking metrics:
+
+```bash
+cd sim && make run
+```
+
+This is the apples-to-apples comparison the physical runs could not give. On the
+synthetic track, fusion produces the smoothest steering while tracking nearly as
+tightly as digital, and the debounce holds the switch to a modest rate.
 
 ## Project structure
 
@@ -315,10 +346,11 @@ sketch with both arduino-cli and PlatformIO.
 bifocal/
 ├── firmware/
 │   ├── line_following/            # main Arduino sketch (open this folder in the IDE)
-│   │   ├── line_following.ino      #   setup(), loop(), strategy dispatch, CSV logger
+│   │   ├── line_following.ino      #   loop, strategy dispatch, adaptive speed, serial CLI, logger
 │   │   ├── steering.h              #   5-sensor line position, 2-sensor fallback, PID_c
-│   │   ├── analoglinesensors.h     #   AnalogLineSensors_c (analogRead pipeline + EMA)
-│   │   ├── digitallinesensors.h    #   DigitalLineSensors_c (RC decay pipeline + EMA)
+│   │   ├── analoglinesensors.h     #   AnalogLineSensors_c (analog pipeline, rolling variance, filters)
+│   │   ├── digitallinesensors.h    #   DigitalLineSensors_c (RC decay pipeline, rolling variance, filters)
+│   │   ├── persistence.h           #   EEPROM calibration save/load
 │   │   ├── motors.h                #   Motors_c (PWM and direction)
 │   │   ├── encoders.h              #   quadrature encoder ISRs (AVR register-level)
 │   │   └── kinematics.h            #   Kinematics_c (configurable differential-drive odometry)
@@ -330,18 +362,23 @@ bifocal/
 ├── analysis/
 │   ├── RT_Results.ipynb           # exploratory notebook (pandas, seaborn)
 │   ├── make_gallery.py            # regenerates the main gallery figures
-│   └── sensor_noise.py            # middle-sensor noise investigation
+│   ├── sensor_noise.py            # middle-sensor noise investigation
+│   └── statistics.py              # bootstrap CIs and significance tests
+├── sim/                           # offline replay harness (make run), host-only
 ├── tests/                         # host unit tests (stubbed Arduino API, make test)
 ├── gallery/                       # generated figures (checked in)
 ├── docs/
 │   ├── variance-based-sensor-switching-paper.pdf
+│   ├── addendum.md                #   what changed since the paper
 │   ├── odometry-calibration.md
 │   ├── sensor-noise.md
+│   ├── statistics.md
 │   └── build-and-ci.md
 ├── assets/logos/                  # tech-stack logos used by this README
 ├── .github/workflows/ci.yml       # compile CI (arduino-cli + PlatformIO)
 ├── platformio.ini
 ├── AUTHORS
+├── CONTRIBUTING.md
 ├── LICENSE
 └── README.md
 ```
@@ -371,20 +408,25 @@ the format issues (2 and 3) for any runs collected from now on.
 The original study's roadmap is now implemented in firmware and tooling:
 
 - **Controller.** Full 5-sensor weighted position and a PID option; a debounced
-  switch (hysteresis plus dwell); and an inverse-variance fusion mode.
-- **Sensing.** An optional EMA low-pass filter on calibrated readings, and a
-  written investigation of the noisy middle sensor
-  ([docs/sensor-noise.md](docs/sensor-noise.md)).
+  switch (hysteresis plus dwell); an inverse-variance fusion mode; adaptive speed;
+  and a live serial interface to change method, gains, and speed at runtime.
+- **Sensing.** Non-blocking rolling variance; an optional EMA low-pass filter, a
+  median outlier clamp, and a per-sensor gain trim; and a written investigation
+  of the noisy middle sensor ([docs/sensor-noise.md](docs/sensor-noise.md)).
 - **Odometry.** Configurable wheel geometry with a calibration helper sketch and
   procedure ([docs/odometry-calibration.md](docs/odometry-calibration.md)). The
   heading formula was corrected during the refactor.
-- **Data.** Clean, fixed-rate, timestamped CSV logging.
-- **Tooling.** A PlatformIO project, compile CI, and host unit tests.
+- **Data.** Clean, fixed-rate, timestamped CSV logging, and EEPROM calibration
+  persistence.
+- **Tooling.** A PlatformIO project, compile CI, host unit tests, an offline
+  replay simulation ([sim/](sim/)), and a statistical re-analysis with bootstrap
+  confidence intervals ([docs/statistics.md](docs/statistics.md)).
 
 Still open, because it needs the physical robot: tune the PID gains and the
-switch margin and dwell on the track, and collect more and longer runs
+switch margin and dwell on the track, and collect more and longer clean-CSV runs
 (especially for switching and fusion) to make the heading-smoothness comparison
-statistically solid.
+statistically solid. The addendum ([docs/addendum.md](docs/addendum.md)) records
+what changed since the paper.
 
 ## Firmware fixes in the refactor
 
