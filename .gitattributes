@@ -1,0 +1,7 @@
+# Normalise line endings so the repo stops churning between CRLF and LF.
+* text=auto eol=lf
+
+# Treat these as binary (never touch line endings / never diff as text).
+*.pdf binary
+*.ipynb -text
+*.hex binary
