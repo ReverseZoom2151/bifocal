@@ -17,6 +17,11 @@
  * turn term is either a simple proportional term or a small PID (STEER_MODE).
  * Wheel-encoder odometry logs heading (theta). Every control tick is written as
  * one timestamped CSV row over Serial for offline analysis.
+ *
+ * Optional modules can be switched on with the flags in the configuration block
+ * (all default off, baseline behavior unchanged): a 1D Kalman fusion filter
+ * (kalman.h), a learned switching policy (policy.h), line-loss recovery
+ * (recovery.h), and analog/digital disagreement logging (disagreement.h).
  */
 
 #include "analoglinesensors.h"
@@ -26,6 +31,10 @@
 #include "encoders.h"
 #include "kinematics.h"
 #include "persistence.h"
+#include "kalman.h"
+#include "disagreement.h"
+#include "recovery.h"
+#include "policy.h"
 
 // ---- Configuration ---------------------------------------------------------
 #define MAX_RESULTS 80              // number of logged control ticks per trial
@@ -74,6 +83,27 @@
 #define CONTROL_PERIOD_MS 100      // run the controller at ~10 Hz
 #define CONTROL_DT        0.1      // matching period in seconds, for PID
 
+// ---- Optional advanced modules (opt-in) ------------------------------------
+// Each defaults to 0, which keeps the baseline behavior byte-identical. Turn one
+// on to route the corresponding module in. They are independent.
+//   FUSION_USE_KALMAN: METHOD_FUSION blends with a 1D Kalman filter (kalman.h)
+//                      instead of the plain inverse-variance weighting.
+//   SWITCH_USE_POLICY: METHOD_SWITCHING picks the array with the learned
+//                      logistic policy (policy.h) instead of the fixed margin.
+//   ENABLE_RECOVERY:   line loss triggers coast/search recovery (recovery.h)
+//                      instead of a hard stop.
+//   LOG_DISAGREEMENT:  compute the analog/digital disagreement each tick
+//                      (disagreement.h) and add a column to the CSV.
+#define FUSION_USE_KALMAN 0
+#define SWITCH_USE_POLICY 0
+#define ENABLE_RECOVERY   0
+#define LOG_DISAGREEMENT  0
+
+// Nominal forward distance per control tick (mm), used only by the recovery
+// coast/search limits when ENABLE_RECOVERY is on. Replace with a real odometry
+// distance if you need accurate gap bridging.
+#define RECOVERY_TICK_MM 5.0
+
 // Set to 1 to run the calibration/inspection loop in setup() instead of a trial.
 #define DEBUG_INSPECT 0
 
@@ -85,11 +115,14 @@
 #define STATE_RUNNING_TRIAL 0
 #define STATE_TRIAL_DONE    1
 
-AnalogLineSensors_c  a_sensors;
-DigitalLineSensors_c d_sensors;
-Kinematics_c         kinematics;
-Motors_c             motors;
-PID_c                pid;
+AnalogLineSensors_c    a_sensors;
+DigitalLineSensors_c   d_sensors;
+Kinematics_c           kinematics;
+Motors_c               motors;
+PID_c                  pid;
+KalmanLine1D           kalman;      // used only when FUSION_USE_KALMAN
+DisagreementDetector_c disagree;    // used only when LOG_DISAGREEMENT
+LineRecovery_c         recovery;    // used only when ENABLE_RECOVERY
 
 unsigned long update_ts;
 unsigned long trial_start_ts;
@@ -111,6 +144,7 @@ float g_var_a;        // analog average variance this tick
 float g_var_d;        // digital average variance this tick
 int   g_active;       // array/method used: 0 analog, 1 digital, 2 fusion
 float g_bias;         // forward bias actually applied this tick (logged)
+float g_disagree;     // analog/digital disagreement this tick (LOG_DISAGREEMENT)
 
 // Switching debounce state.
 int           switch_choice = 0;   // 0 analog, 1 digital
@@ -133,12 +167,15 @@ float lineError(float calibrated[5]) {
 // (at W == 0, i.e. a straight) and g_min_bias (at |W| == 1, i.e. a hard
 // correction), so the robot slows into curves and speeds up on straights. The
 // result is clamped to the [min, max] band and stored in g_bias for logging.
-void applySteering(float W) {
+// speedScale (default 1.0) multiplies the forward bias; the recovery state
+// machine uses it to slow down while searching, and 0 to stop.
+void applySteering(float W, float speedScale = 1.0) {
   W = constrain(W, -1.0, 1.0);
 
   float mag = fabs(W);   // 0 straight ... 1 full turn demand
   g_bias = g_max_bias - (g_max_bias - g_min_bias) * mag;
   g_bias = constrain(g_bias, g_min_bias, g_max_bias);
+  g_bias *= speedScale;
 
   float LeftPWM  = g_bias + (MaxTurnPWM * W);
   float RightPWM = g_bias - (MaxTurnPWM * W);
@@ -160,6 +197,12 @@ float computeControl() {
   g_var_d = d_sensors.calculateAverageVariance();
   float e_d = lineError(d_sensors.calibrated);
 
+#if LOG_DISAGREEMENT
+  // Track how much the two arrays disagree. A spike relative to the rolling
+  // baseline suggests a line edge, junction, or surface anomaly.
+  g_disagree = disagree.update(a_sensors.calibrated, d_sensors.calibrated);
+#endif
+
   // Strategy selection is a runtime choice (g_method) so it can be changed live
   // over serial. It defaults to the compile-time FOLLOW_METHOD.
   if (g_method == METHOD_ANALOG) {
@@ -171,16 +214,30 @@ float computeControl() {
     g_line_error = e_d;
 
   } else if (g_method == METHOD_FUSION) {
+#if FUSION_USE_KALMAN
+    // Bayesian fusion: each array's live variance is its measurement noise R.
+    g_line_error = kalman.fuse(e_a, g_var_a, e_d, g_var_d);
+#else
     // Inverse-variance blend: trust the steadier array more, without a hard pick.
     float w_a = 1.0 / (g_var_a + FUSION_EPS);
     float w_d = 1.0 / (g_var_d + FUSION_EPS);
     g_line_error = (w_a * e_a + w_d * e_d) / (w_a + w_d);
+#endif
     g_active     = 2;
 
   } else {   // METHOD_SWITCHING with hysteresis + dwell
-    // Only consider switching once the minimum dwell time has elapsed, and only
-    // switch if the alternative is better by at least the margin.
+    // Only consider switching once the minimum dwell time has elapsed.
     if (millis() - switch_last_ts >= SWITCH_DWELL_MS) {
+#if SWITCH_USE_POLICY
+      // Learned logistic policy decides which array to trust from the two
+      // variances and the current error (scale-invariant, see policy.h).
+      int want = preferDigital(g_var_a, g_var_d, g_line_error) ? 1 : 0;
+      if (want != switch_choice) {
+        switch_choice  = want;
+        switch_last_ts = millis();
+      }
+#else
+      // Fixed margin: switch only if the alternative is better by the margin.
       if (switch_choice == 0) {
         if (g_var_d + SWITCH_MARGIN < g_var_a) {
           switch_choice  = 1;
@@ -192,6 +249,7 @@ float computeControl() {
           switch_last_ts = millis();
         }
       }
+#endif
     }
     g_active     = switch_choice;
     g_line_error = (switch_choice == 0) ? e_a : e_d;
@@ -211,11 +269,26 @@ void followLine() {
   kinematics.update(count_e0, count_e1);
 
   float W = computeControl();
-  applySteering(W);
 
   // End-of-line detection on the two steering sensors of the relevant array(s).
   float a_sum = a_sensors.calibrated[1] + a_sensors.calibrated[3];
   float d_sum = d_sensors.calibrated[1] + d_sensors.calibrated[3];
+
+#if ENABLE_RECOVERY
+  // Instead of a hard stop when the line is lost, coast a short distance to
+  // bridge small gaps, then sweep toward the last-known side to reacquire.
+  bool linePresent = (a_sum >= ANALOG_STOP_SUM) || (d_sum >= DIGITAL_STOP_SUM);
+  RecoveryAction act = recovery.update(linePresent, g_line_error,
+                                       RECOVERY_TICK_MM, (float)CONTROL_PERIOD_MS);
+  if (act.state == REC_STOPPED || act.speedScale <= 0.0) {
+    motors.setMotorsPWM(0, 0);
+  } else if (act.useNormalSteering) {
+    applySteering(W, act.speedScale);
+  } else {
+    applySteering(act.turnBias, act.speedScale);   // sweep to reacquire
+  }
+#else
+  applySteering(W);
 
   // End-of-line test follows the active runtime method.
   if (g_method == METHOD_ANALOG) {
@@ -229,6 +302,7 @@ void followLine() {
       motors.setMotorsPWM(0, 0);
     }
   }
+#endif
 
 }
 
@@ -238,7 +312,11 @@ void followLine() {
 // yields a directly loadable CSV. Collecting more and longer runs is now just a
 // hardware step: this logging is what makes those runs usable.
 void printLogHeader() {
+#if LOG_DISAGREEMENT
+  Serial.println("t_ms,theta,method,line_error,var_a,var_d,bias,disagree");
+#else
   Serial.println("t_ms,theta,method,line_error,var_a,var_d,bias");
+#endif
 }
 
 void logRow() {
@@ -254,7 +332,13 @@ void logRow() {
   Serial.print(",");
   Serial.print(g_var_d, 6);
   Serial.print(",");
+#if LOG_DISAGREEMENT
+  Serial.print(g_bias, 2);
+  Serial.print(",");
+  Serial.println(g_disagree, 4);
+#else
   Serial.println(g_bias, 2);
+#endif
 }
 
 // ---- EEPROM calibration helpers --------------------------------------------
