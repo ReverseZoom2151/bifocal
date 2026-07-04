@@ -1,0 +1,17 @@
+# Python dependencies for the Bifocal analysis and figure generation.
+# Install with:  pip install -r requirements.txt
+#
+# Used by:
+#   analysis/make_gallery.py   numpy, matplotlib
+#   analysis/sensor_noise.py   numpy, matplotlib
+#   analysis/statistics.py     numpy, matplotlib, scipy (optional, see below)
+#   analysis/RT_Results.ipynb  pandas, numpy, matplotlib, seaborn
+pandas
+numpy
+matplotlib
+seaborn
+
+# Optional. analysis/statistics.py uses scipy.stats.mannwhitneyu when it is
+# available and otherwise falls back to a built-in permutation test, so scipy
+# is not strictly required but gives the exact Mann-Whitney U result.
+scipy
