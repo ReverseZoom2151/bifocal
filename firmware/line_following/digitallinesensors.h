@@ -1,12 +1,19 @@
 #ifndef DIGITALLINESENSORS_H
 #define DIGITALLINESENSORS_H
 
-// Number of samples used per variance estimate.
+// Number of samples used per variance estimate. This is also the length of the
+// rolling variance window.
 #define D_MAX_SAMPLES 10
 
 // Default smoothing factor for the optional EMA low-pass filter on calibrated
 // readings. Range 0..1: higher tracks faster, lower smooths harder.
 #define D_FILTER_ALPHA 0.4
+
+// Default outlier clamp for the calibrated path. A new per-sensor calibrated
+// value that deviates from the window median by more than this (in calibrated
+// 0..1 units) is clamped back toward the median before it reaches variance[].
+// Mild by default so normal motion is untouched and only large spikes are cut.
+#define D_OUTLIER_CLAMP 0.3
 
 // IR emitter and the 5 line-sensor pins in RC-discharge (digital) mode.
 // NOTE: these macros are D_-prefixed so they cannot collide with the analog
@@ -23,6 +30,13 @@
 // sensor capacitor, then time how long it takes to discharge through the
 // phototransistor. Longer time == darker surface. Values are normalised to
 // 0..1 using per-sensor offset/scale from calibrate().
+//
+// Variance is now computed with a rolling (non-blocking) window: getCalibrated()
+// pushes the newest calibrated[] into a per-sensor ring buffer and updates
+// variance[] in O(1) from running sum and sum-of-squares. This replaces the old
+// per-call blocking loop that took D_MAX_SAMPLES fresh readings each tick, so
+// the controller no longer stalls. It is the one intended behavioural change;
+// all other features default to a no-op.
 class DigitalLineSensors_c {
 
   private:
@@ -39,11 +53,30 @@ class DigitalLineSensors_c {
     float filter_alpha = D_FILTER_ALPHA;
     bool  filter_valid = false;
 
+    // Rolling variance window. ring[] holds the last D_MAX_SAMPLES calibrated
+    // values per sensor; ring_sum/ring_sumsq keep running totals so variance[]
+    // updates in O(1) per push. ring_valid is false until the window is seeded.
+    float ring[5][D_MAX_SAMPLES];
+    float ring_sum[5]   = { 0.0, 0.0, 0.0, 0.0, 0.0 };
+    float ring_sumsq[5] = { 0.0, 0.0, 0.0, 0.0, 0.0 };
+    int   ring_head  = 0;
+    int   ring_count = 0;
+    bool  ring_valid = false;
+
+    // Outlier clamp strength (calibrated units). Configurable via the ctor
+    // default D_OUTLIER_CLAMP and setOutlierClamp().
+    float outlier_clamp = D_OUTLIER_CLAMP;
+
   public:
 
     float calibrated[5];
     float filtered[5];       // EMA-smoothed readings after getFiltered()
-    float variance[5];
+    float variance[5];       // per-sensor rolling variance (population, window)
+
+    // Per-sensor gain trim applied after offset/scale. Default 1.0 leaves the
+    // calibrated value unchanged. Lets the digital middle-sensor gain (and any
+    // other) be tamed at runtime without hard-coding a value in calibrate().
+    float gainTrim[5] = { 1.0, 1.0, 1.0, 1.0, 1.0 };
 
     // When true, getCalibrated() also updates filtered[] (opt-in). Default off
     // so behaviour is byte-identical to the unfiltered pipeline.
@@ -55,6 +88,34 @@ class DigitalLineSensors_c {
     // harder. Out-of-range values are ignored.
     void setFilterAlpha(float alpha) {
       if (alpha >= 0.0 && alpha <= 1.0) filter_alpha = alpha;
+    }
+
+    // Set the outlier clamp strength (calibrated units, > 0). Larger values are
+    // more permissive (fewer clamps); smaller values cut spikes harder.
+    void setOutlierClamp(float clamp) {
+      if (clamp > 0.0) outlier_clamp = clamp;
+    }
+
+    // Set the per-sensor gain trim (index 0..4, trim > 0). Ignored otherwise.
+    void setGainTrim(int index, float trim) {
+      if (index >= 0 && index < 5 && trim > 0.0) gainTrim[index] = trim;
+    }
+
+    // Copy the current per-sensor offset and scale out to the caller.
+    void getCalibration(float outOffset[5], float outScale[5]) {
+      for (int i = 0; i < 5; i++) {
+        outOffset[i] = offset[i];
+        outScale[i]  = scale[i];
+      }
+    }
+
+    // Set the per-sensor offset and scale directly, so a prior calibration can
+    // be restored without running calibrate() again.
+    void setCalibration(const float inOffset[5], const float inScale[5]) {
+      for (int i = 0; i < 5; i++) {
+        offset[i] = inOffset[i];
+        scale[i]  = inScale[i];
+      }
     }
 
     // Read all sensors in parallel by charging the capacitors HIGH, releasing
@@ -129,14 +190,102 @@ class DigitalLineSensors_c {
 
     }
 
-    // Apply calibration to a fresh set of readings, filling calibrated[].
+    // Median of the current window for one sensor. Used by the outlier guard.
+    // O(N^2) insertion sort over the small fixed window; no allocation.
+    float windowMedian(int sensor) {
+
+      int n = ring_count;
+      if (n <= 0) return 0.0;
+
+      float tmp[D_MAX_SAMPLES];
+      for (int k = 0; k < n; k++) tmp[k] = ring[sensor][k];
+
+      for (int a = 1; a < n; a++) {
+        float key = tmp[a];
+        int b = a - 1;
+        while (b >= 0 && tmp[b] > key) {
+          tmp[b + 1] = tmp[b];
+          b--;
+        }
+        tmp[b + 1] = key;
+      }
+
+      if (n % 2 == 1) return tmp[n / 2];
+      return 0.5 * (tmp[n / 2 - 1] + tmp[n / 2]);
+    }
+
+    // Push the current calibrated[] into the rolling window and refresh the
+    // per-sensor sum/sum-of-squares. On first use the whole window is seeded
+    // with the first sample so early variance estimates are sane (zero, not a
+    // ramp from an empty window).
+    void pushWindow() {
+
+      if (!ring_valid) {
+        for (int i = 0; i < 5; i++) {
+          ring_sum[i]   = 0.0;
+          ring_sumsq[i] = 0.0;
+          for (int k = 0; k < D_MAX_SAMPLES; k++) {
+            ring[i][k]     = calibrated[i];
+            ring_sum[i]   += calibrated[i];
+            ring_sumsq[i] += calibrated[i] * calibrated[i];
+          }
+        }
+        ring_head  = 0;
+        ring_count = D_MAX_SAMPLES;
+        ring_valid = true;
+        updateRollingVariance();
+        return;
+      }
+
+      for (int i = 0; i < 5; i++) {
+        float old = ring[i][ring_head];
+        ring_sum[i]   -= old;
+        ring_sumsq[i] -= old * old;
+        ring[i][ring_head] = calibrated[i];
+        ring_sum[i]   += calibrated[i];
+        ring_sumsq[i] += calibrated[i] * calibrated[i];
+      }
+      ring_head = (ring_head + 1) % D_MAX_SAMPLES;
+
+      updateRollingVariance();
+    }
+
+    // Recompute population variance for every sensor from the running totals.
+    void updateRollingVariance() {
+      float n = (float)ring_count;
+      for (int i = 0; i < 5; i++) {
+        float mean = ring_sum[i] / n;
+        float v = ring_sumsq[i] / n - mean * mean;
+        if (v < 0.0) v = 0.0;   // guard tiny negative from float rounding
+        variance[i] = v;
+      }
+    }
+
+    // Apply calibration to a fresh set of readings, filling calibrated[], then
+    // update the rolling variance window. Cheap and non-blocking: one hardware
+    // read plus O(1) window maintenance. Also applies the gain trim and a light
+    // outlier clamp toward the window median before the value is stored.
     void getCalibrated() {
 
       readAllSensors();
 
       for (int i = 0; i < 5; i++) {
-        calibrated[i] = ((float)sensorReadings[i] - offset[i]) * scale[i];
+        float c = ((float)sensorReadings[i] - offset[i]) * scale[i] * gainTrim[i];
+
+        // Reject single-sample spikes: clamp the new value to within
+        // outlier_clamp of the window median. Skipped until the window exists.
+        if (ring_valid) {
+          float med = windowMedian(i);
+          float lo = med - outlier_clamp;
+          float hi = med + outlier_clamp;
+          if (c < lo) c = lo;
+          else if (c > hi) c = hi;
+        }
+
+        calibrated[i] = c;
       }
+
+      pushWindow();
 
       if (useFilter) updateFilter();
 
@@ -188,36 +337,11 @@ class DigitalLineSensors_c {
       Serial.print("\n");
     }
 
-    // Estimate per-sensor variance over D_MAX_SAMPLES calibrated readings and
-    // store it in variance[]. Lower variance == more stable sensor data.
+    // Take one fresh reading and refresh the rolling variance[]. Non-blocking:
+    // the old D_MAX_SAMPLES-deep resampling loop is gone. getCalibrated() does
+    // the window maintenance, so this is a thin, API-preserving wrapper.
     void calculateVariance() {
-
-      const int num_samples = D_MAX_SAMPLES;
-      float samples[5][D_MAX_SAMPLES];         // fixed size (no VLA)
-      float sum[5]  = { 0.0, 0.0, 0.0, 0.0, 0.0 };
-      float mean[5] = { 0.0, 0.0, 0.0, 0.0, 0.0 };
-
-      for (int sample = 0; sample < num_samples; sample++) {
-        getCalibrated();
-        for (int sensor = 0; sensor < 5; sensor++) {
-          samples[sensor][sample] = calibrated[sensor];
-          sum[sensor] += calibrated[sensor];
-        }
-      }
-
-      for (int sensor = 0; sensor < 5; sensor++) {
-        mean[sensor] = sum[sensor] / (float)num_samples;
-      }
-
-      for (int sensor = 0; sensor < 5; sensor++) {
-        variance[sensor] = 0.0;
-        for (int sample = 0; sample < num_samples; sample++) {
-          float d = samples[sensor][sample] - mean[sensor];
-          variance[sensor] += d * d;
-        }
-        variance[sensor] /= (float)num_samples;
-      }
-
+      getCalibrated();
     }
 
     void printVariance() {
@@ -236,10 +360,11 @@ class DigitalLineSensors_c {
       Serial.print("\n");
     }
 
-    // Mean variance across all 5 sensors. Refreshes variance[] first.
+    // Mean rolling variance across all 5 sensors. Takes one fresh reading first
+    // (so calibrated[] is current for the caller) then averages variance[].
     float calculateAverageVariance() {
 
-      calculateVariance();
+      getCalibrated();
 
       float totalVariance = 0.0;
       for (int i = 0; i < 5; i++) {
