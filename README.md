@@ -130,13 +130,13 @@ run can be logged and analysed offline.
 
 | | Tool | Role |
 |-|------|------|
-| <img src="https://cdn.simpleicons.org/arduino" height="18"> | Arduino (AVR toolchain) | Build and flash the ATmega32U4 firmware |
-| <img src="https://cdn.simpleicons.org/cplusplus" height="18"> | C++ | Firmware, written as an Arduino sketch plus headers |
-| <img src="https://cdn.simpleicons.org/python" height="18"> | Python | Data analysis and figure generation |
-| <img src="https://cdn.simpleicons.org/jupyter" height="18"> | Jupyter | Exploratory notebook (`analysis/RT_Results.ipynb`) |
-| <img src="https://cdn.simpleicons.org/pandas" height="18"> | pandas | Reading and wrangling the trial CSVs |
-| <img src="https://cdn.simpleicons.org/numpy" height="18"> | NumPy | Variance, statistics, array maths |
-| <img src="https://cdn.simpleicons.org/scipy" height="18"> | matplotlib / seaborn | Plotting (matplotlib has no brand icon; SciPy stack shown) |
+| <img src="assets/logos/arduino.svg" height="20"> | Arduino (AVR toolchain) | Build and flash the ATmega32U4 firmware |
+| <img src="assets/logos/cplusplus.svg" height="20"> | C++ | Firmware, written as an Arduino sketch plus headers |
+| <img src="assets/logos/python.svg" height="20"> | Python | Data analysis and figure generation |
+| <img src="assets/logos/jupyter.svg" height="20"> | Jupyter | Exploratory notebook (`analysis/RT_Results.ipynb`) |
+| <img src="assets/logos/pandas.svg" height="20"> | pandas | Reading and wrangling the trial CSVs |
+| <img src="assets/logos/numpy.svg" height="20"> | NumPy | Variance, statistics, array maths |
+| <img src="assets/logos/matplotlib.svg" height="20"> | matplotlib / seaborn | Plotting the gallery figures |
 
 ## Hardware
 
