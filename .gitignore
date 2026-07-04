@@ -23,3 +23,6 @@ env/
 Thumbs.db
 .vscode/
 .idea/
+
+# Compiled host test binaries
+tests/*.exe
