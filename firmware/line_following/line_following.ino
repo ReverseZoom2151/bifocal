@@ -25,6 +25,7 @@
 #include "motors.h"
 #include "encoders.h"
 #include "kinematics.h"
+#include "persistence.h"
 
 // ---- Configuration ---------------------------------------------------------
 #define MAX_RESULTS 80              // number of logged control ticks per trial
@@ -33,7 +34,20 @@
 #define METHOD_DIGITAL   1
 #define METHOD_SWITCHING 2
 #define METHOD_FUSION    3
-#define FOLLOW_METHOD    METHOD_SWITCHING   // <-- choose the strategy here
+#define FOLLOW_METHOD    METHOD_SWITCHING   // <-- default strategy (runtime-selectable)
+
+// Adaptive forward speed. Instead of a constant forward bias, the bias is
+// scaled down as the steering demand grows so the robot slows for sharp
+// corrections and curves, and runs faster on straights. MAX_BIAS_PWM is used
+// when the turn term is near zero, MIN_BIAS_PWM when it is saturated. Both are
+// runtime-adjustable via the 's' serial command (see the CLI block below).
+#define MIN_BIAS_PWM 18.0
+#define MAX_BIAS_PWM 30.0
+
+// Load a previously saved calibration from EEPROM (if valid) instead of
+// spinning to recalibrate at every boot. Set to 1 to opt in. Even when 0, a
+// fresh spin calibration is still written to EEPROM so it can be reused later.
+#define USE_SAVED_CALIBRATION 0
 
 // Steering input: 1 uses the full 5-sensor weighted position (default),
 // 0 falls back to the old 2-sensor measurement (sensors 1 and 3 only).
@@ -82,14 +96,21 @@ unsigned long trial_start_ts;
 int   results_index;
 int   state;
 
-const float BiasPWM    = 30.0;   // forward bias
 const float MaxTurnPWM = 20.0;   // max differential applied from steering term
+
+// ---- Runtime-tunable state (adjustable over serial without recompiling) ----
+// g_method defaults to the compile-time FOLLOW_METHOD but can be changed live
+// with the 'm' command. g_min_bias/g_max_bias hold the adaptive-speed bounds.
+int   g_method   = FOLLOW_METHOD;
+float g_min_bias = MIN_BIAS_PWM;
+float g_max_bias = MAX_BIAS_PWM;
 
 // ---- Per-tick control outputs (also used by the CSV logger) ----------------
 float g_line_error;   // steering error actually used this tick, [-1, 1]
 float g_var_a;        // analog average variance this tick
 float g_var_d;        // digital average variance this tick
 int   g_active;       // array/method used: 0 analog, 1 digital, 2 fusion
+float g_bias;         // forward bias actually applied this tick (logged)
 
 // Switching debounce state.
 int           switch_choice = 0;   // 0 analog, 1 digital
@@ -107,18 +128,28 @@ float lineError(float calibrated[5]) {
 
 // Convert a steering term into motor commands and apply them. W is clamped to
 // [-1, 1] so a large PID output cannot invert or saturate the drive.
+//
+// Adaptive speed: the forward bias is interpolated linearly between g_max_bias
+// (at W == 0, i.e. a straight) and g_min_bias (at |W| == 1, i.e. a hard
+// correction), so the robot slows into curves and speeds up on straights. The
+// result is clamped to the [min, max] band and stored in g_bias for logging.
 void applySteering(float W) {
   W = constrain(W, -1.0, 1.0);
-  float LeftPWM  = BiasPWM + (MaxTurnPWM * W);
-  float RightPWM = BiasPWM - (MaxTurnPWM * W);
+
+  float mag = fabs(W);   // 0 straight ... 1 full turn demand
+  g_bias = g_max_bias - (g_max_bias - g_min_bias) * mag;
+  g_bias = constrain(g_bias, g_min_bias, g_max_bias);
+
+  float LeftPWM  = g_bias + (MaxTurnPWM * W);
+  float RightPWM = g_bias - (MaxTurnPWM * W);
   motors.setMotorsPWM(LeftPWM, RightPWM);
 }
 
 // ---- Unified control step --------------------------------------------------
 // Samples both arrays every tick so every log row is complete and the two
 // methods stay directly comparable. Computes each array's line-position error
-// and variance, selects/fuses per FOLLOW_METHOD, stores logging globals, and
-// returns the turn term W.
+// and variance, selects/fuses per the runtime g_method, stores logging globals,
+// and returns the turn term W.
 float computeControl() {
 
   // calculateAverageVariance() refreshes calibrated[] as a side effect, so the
@@ -129,40 +160,42 @@ float computeControl() {
   g_var_d = d_sensors.calculateAverageVariance();
   float e_d = lineError(d_sensors.calibrated);
 
-#if FOLLOW_METHOD == METHOD_ANALOG
-  g_active     = 0;
-  g_line_error = e_a;
+  // Strategy selection is a runtime choice (g_method) so it can be changed live
+  // over serial. It defaults to the compile-time FOLLOW_METHOD.
+  if (g_method == METHOD_ANALOG) {
+    g_active     = 0;
+    g_line_error = e_a;
 
-#elif FOLLOW_METHOD == METHOD_DIGITAL
-  g_active     = 1;
-  g_line_error = e_d;
+  } else if (g_method == METHOD_DIGITAL) {
+    g_active     = 1;
+    g_line_error = e_d;
 
-#elif FOLLOW_METHOD == METHOD_FUSION
-  // Inverse-variance blend: trust the steadier array more, without a hard pick.
-  float w_a = 1.0 / (g_var_a + FUSION_EPS);
-  float w_d = 1.0 / (g_var_d + FUSION_EPS);
-  g_line_error = (w_a * e_a + w_d * e_d) / (w_a + w_d);
-  g_active     = 2;
+  } else if (g_method == METHOD_FUSION) {
+    // Inverse-variance blend: trust the steadier array more, without a hard pick.
+    float w_a = 1.0 / (g_var_a + FUSION_EPS);
+    float w_d = 1.0 / (g_var_d + FUSION_EPS);
+    g_line_error = (w_a * e_a + w_d * e_d) / (w_a + w_d);
+    g_active     = 2;
 
-#else   // METHOD_SWITCHING with hysteresis + dwell
-  // Only consider switching once the minimum dwell time has elapsed, and only
-  // switch if the alternative is better by at least the margin.
-  if (millis() - switch_last_ts >= SWITCH_DWELL_MS) {
-    if (switch_choice == 0) {
-      if (g_var_d + SWITCH_MARGIN < g_var_a) {
-        switch_choice  = 1;
-        switch_last_ts = millis();
-      }
-    } else {
-      if (g_var_a + SWITCH_MARGIN < g_var_d) {
-        switch_choice  = 0;
-        switch_last_ts = millis();
+  } else {   // METHOD_SWITCHING with hysteresis + dwell
+    // Only consider switching once the minimum dwell time has elapsed, and only
+    // switch if the alternative is better by at least the margin.
+    if (millis() - switch_last_ts >= SWITCH_DWELL_MS) {
+      if (switch_choice == 0) {
+        if (g_var_d + SWITCH_MARGIN < g_var_a) {
+          switch_choice  = 1;
+          switch_last_ts = millis();
+        }
+      } else {
+        if (g_var_a + SWITCH_MARGIN < g_var_d) {
+          switch_choice  = 0;
+          switch_last_ts = millis();
+        }
       }
     }
+    g_active     = switch_choice;
+    g_line_error = (switch_choice == 0) ? e_a : e_d;
   }
-  g_active     = switch_choice;
-  g_line_error = (switch_choice == 0) ? e_a : e_d;
-#endif
 
 #if STEER_MODE == STEER_PID
   return pid.update(g_line_error, CONTROL_DT);
@@ -184,17 +217,18 @@ void followLine() {
   float a_sum = a_sensors.calibrated[1] + a_sensors.calibrated[3];
   float d_sum = d_sensors.calibrated[1] + d_sensors.calibrated[3];
 
-#if FOLLOW_METHOD == METHOD_ANALOG
-  if (a_sum < ANALOG_STOP_SUM) motors.setMotorsPWM(0, 0);
-#elif FOLLOW_METHOD == METHOD_DIGITAL
-  if (d_sum < DIGITAL_STOP_SUM) motors.setMotorsPWM(0, 0);
-#else
-  // Switching and fusion both listen to the whole board: stop only when both
-  // arrays have lost the line.
-  if (a_sum < ANALOG_STOP_SUM && d_sum < DIGITAL_STOP_SUM) {
-    motors.setMotorsPWM(0, 0);
+  // End-of-line test follows the active runtime method.
+  if (g_method == METHOD_ANALOG) {
+    if (a_sum < ANALOG_STOP_SUM) motors.setMotorsPWM(0, 0);
+  } else if (g_method == METHOD_DIGITAL) {
+    if (d_sum < DIGITAL_STOP_SUM) motors.setMotorsPWM(0, 0);
+  } else {
+    // Switching and fusion both listen to the whole board: stop only when both
+    // arrays have lost the line.
+    if (a_sum < ANALOG_STOP_SUM && d_sum < DIGITAL_STOP_SUM) {
+      motors.setMotorsPWM(0, 0);
+    }
   }
-#endif
 
 }
 
@@ -204,7 +238,7 @@ void followLine() {
 // yields a directly loadable CSV. Collecting more and longer runs is now just a
 // hardware step: this logging is what makes those runs usable.
 void printLogHeader() {
-  Serial.println("t_ms,theta,method,line_error,var_a,var_d");
+  Serial.println("t_ms,theta,method,line_error,var_a,var_d,bias");
 }
 
 void logRow() {
@@ -218,7 +252,167 @@ void logRow() {
   Serial.print(",");
   Serial.print(g_var_a, 6);
   Serial.print(",");
-  Serial.println(g_var_d, 6);
+  Serial.print(g_var_d, 6);
+  Serial.print(",");
+  Serial.println(g_bias, 2);
+}
+
+// ---- EEPROM calibration helpers --------------------------------------------
+// Read the live calibration out of both sensor objects and persist it.
+void saveCurrentCalibration() {
+  float aOff[5], aScale[5], dOff[5], dScale[5];
+  a_sensors.getCalibration(aOff, aScale);
+  d_sensors.getCalibration(dOff, dScale);
+  saveCalibration(aOff, aScale, dOff, dScale);
+}
+
+// Load a stored calibration (if valid) into both sensor objects. Returns false
+// and changes nothing when no valid block is present.
+bool loadStoredCalibration() {
+  float aOff[5], aScale[5], dOff[5], dScale[5];
+  if (!loadCalibration(aOff, aScale, dOff, dScale)) return false;
+  a_sensors.setCalibration(aOff, aScale);
+  d_sensors.setCalibration(dOff, dScale);
+  return true;
+}
+
+// ---- Live serial tuning CLI ------------------------------------------------
+// A tiny, non-blocking, fixed-buffer command parser so parameters can be
+// changed at runtime without recompiling. Lines are terminated by newline.
+// Commands (arguments are whitespace separated):
+//   m <0-3>            select method: 0 analog, 1 digital, 2 switching, 3 fusion
+//   p <kp> <ki> <kd>   set PID gains (also resets the integrator)
+//   s <min> <max>      set adaptive-speed bias bounds (0 <= min <= max)
+//   w                  write/save the current calibration to EEPROM
+//   l                  load the saved calibration from EEPROM
+//   c                  clear (invalidate) the saved calibration
+//   ?                  print current settings
+// Responses starting with '#' are informational, not CSV rows.
+#define CMD_BUF_LEN 48
+char cmd_buf[CMD_BUF_LEN];
+int  cmd_len = 0;
+
+void printSettings() {
+  Serial.print("# method=");
+  Serial.println(g_method);
+  Serial.print("# kp=");
+  Serial.print(pid.Kp, 4);
+  Serial.print(" ki=");
+  Serial.print(pid.Ki, 4);
+  Serial.print(" kd=");
+  Serial.println(pid.Kd, 4);
+  Serial.print("# min_bias=");
+  Serial.print(g_min_bias, 2);
+  Serial.print(" max_bias=");
+  Serial.println(g_max_bias, 2);
+  Serial.print("# saved_cal=");
+  Serial.println(hasValidCalibration() ? 1 : 0);
+}
+
+// Parse and act on one complete command line. Uses strtok/atof only; no String
+// and no dynamic allocation.
+void handleCommand(char *line) {
+  char *tok = strtok(line, " \t");
+  if (tok == NULL) return;
+  char cmd = tok[0];
+
+  switch (cmd) {
+    case 'm': {
+      char *a = strtok(NULL, " \t");
+      if (a != NULL) {
+        int m = atoi(a);
+        if (m >= METHOD_ANALOG && m <= METHOD_FUSION) {
+          g_method = m;
+          Serial.print("# method set to ");
+          Serial.println(g_method);
+        } else {
+          Serial.println("# err: method must be 0-3");
+        }
+      } else {
+        Serial.println("# err: m <0-3>");
+      }
+      break;
+    }
+
+    case 'p': {
+      char *a = strtok(NULL, " \t");
+      char *b = strtok(NULL, " \t");
+      char *c = strtok(NULL, " \t");
+      if (a != NULL && b != NULL && c != NULL) {
+        pid.Kp = atof(a);
+        pid.Ki = atof(b);
+        pid.Kd = atof(c);
+        pid.reset();
+        Serial.println("# pid gains updated");
+      } else {
+        Serial.println("# err: p <kp> <ki> <kd>");
+      }
+      break;
+    }
+
+    case 's': {
+      char *a = strtok(NULL, " \t");
+      char *b = strtok(NULL, " \t");
+      if (a != NULL && b != NULL) {
+        float mn = atof(a);
+        float mx = atof(b);
+        if (mn >= 0.0 && mx >= mn) {
+          g_min_bias = mn;
+          g_max_bias = mx;
+          Serial.println("# speed bounds updated");
+        } else {
+          Serial.println("# err: need 0 <= min <= max");
+        }
+      } else {
+        Serial.println("# err: s <min> <max>");
+      }
+      break;
+    }
+
+    case 'w':
+      saveCurrentCalibration();
+      Serial.println("# calibration saved");
+      break;
+
+    case 'l':
+      if (loadStoredCalibration()) {
+        Serial.println("# calibration loaded");
+      } else {
+        Serial.println("# err: no valid saved calibration");
+      }
+      break;
+
+    case 'c':
+      clearCalibration();
+      Serial.println("# calibration cleared");
+      break;
+
+    case '?':
+      printSettings();
+      break;
+
+    default:
+      Serial.println("# err: unknown cmd");
+      break;
+  }
+}
+
+// Non-blocking serial reader. Accumulates characters into a fixed buffer and
+// dispatches on newline. Safe to call every loop iteration.
+void pollSerial() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;             // ignore CR (CRLF terminals)
+    if (c == '\n') {
+      cmd_buf[cmd_len] = '\0';
+      if (cmd_len > 0) handleCommand(cmd_buf);
+      cmd_len = 0;
+    } else if (cmd_len < CMD_BUF_LEN - 1) {
+      cmd_buf[cmd_len++] = c;
+    } else {
+      cmd_len = 0;                        // overflow: drop the partial line
+    }
+  }
 }
 
 // ---- Arduino entry points --------------------------------------------------
@@ -232,11 +426,27 @@ void setup() {
   setupEncoder0();
   setupEncoder1();
 
-  // Calibrate by spinning on the spot over black + white surfaces.
-  motors.setMotorsPWM(-80, 80);
-  a_sensors.calibrate();
-  d_sensors.calibrate();
-  motors.setMotorsPWM(0, 0);
+  // Calibration: optionally reuse a valid EEPROM-stored calibration and skip
+  // the spin, otherwise spin on the spot over black + white and store the new
+  // calibration for future boots. The magic guard means a blank EEPROM never
+  // loads garbage.
+  bool loaded = false;
+#if USE_SAVED_CALIBRATION
+  if (hasValidCalibration()) {
+    loaded = loadStoredCalibration();
+    Serial.println(loaded ? "# loaded saved calibration"
+                          : "# saved calibration load failed");
+  }
+#endif
+
+  if (!loaded) {
+    motors.setMotorsPWM(-80, 80);
+    a_sensors.calibrate();
+    d_sensors.calibrate();
+    motors.setMotorsPWM(0, 0);
+    saveCurrentCalibration();
+    Serial.println("# calibration saved to EEPROM");
+  }
 
   // Beep + delay so the robot can be placed at the start line.
   pinMode(6, OUTPUT);
@@ -269,6 +479,10 @@ void setup() {
 }
 
 void loop() {
+
+  // Always service the serial CLI, in every state, so parameters can be tuned
+  // during a trial or after it has finished.
+  pollSerial();
 
   if (state == STATE_RUNNING_TRIAL) {
 
