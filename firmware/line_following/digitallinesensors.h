@@ -15,6 +15,17 @@
 // Mild by default so normal motion is untouched and only large spikes are cut.
 #define D_OUTLIER_CLAMP 0.3
 
+// Default adaptation rate for the optional online recalibration mode. Each
+// getCalibrated() nudges offset/scale this fraction of the way toward the
+// observed raw range. Conservative so adaptation is slow and stable.
+#define D_AUTO_RATE 0.01
+
+// Default relax rate for the online running min/max. Each update moves the
+// running min and max this fraction of the way toward their midpoint, so a
+// transient extreme does not permanently widen the range. A new true extreme
+// still expands the range immediately.
+#define D_AUTO_RELAX 0.001
+
 // IR emitter and the 5 line-sensor pins in RC-discharge (digital) mode.
 // NOTE: these macros are D_-prefixed so they cannot collide with the analog
 // header when both are included in the same sketch (the original code reused
@@ -67,6 +78,18 @@ class DigitalLineSensors_c {
     // default D_OUTLIER_CLAMP and setOutlierClamp().
     float outlier_clamp = D_OUTLIER_CLAMP;
 
+    // Online recalibration running extremes (raw units) and their valid flag.
+    // auto_valid is false until seeded from the current calibration.
+    float auto_min[5];
+    float auto_max[5];
+    bool  auto_valid = false;
+
+    // Online recalibration rates. auto_adapt_rate is how fast offset/scale move
+    // toward the observed range; auto_relax_rate is how fast the running min/max
+    // decay back toward their midpoint. Both conservative, set via setAutoRate().
+    float auto_adapt_rate  = D_AUTO_RATE;
+    float auto_relax_rate  = D_AUTO_RELAX;
+
   public:
 
     float calibrated[5];
@@ -81,6 +104,12 @@ class DigitalLineSensors_c {
     // When true, getCalibrated() also updates filtered[] (opt-in). Default off
     // so behaviour is byte-identical to the unfiltered pipeline.
     bool  useFilter = false;
+
+    // When true, getCalibrated() tracks a slow running min/max of the RAW
+    // readings and nudges offset/scale toward that range so the robot adapts to
+    // changing lighting or surface without a reboot (opt-in). Default off so
+    // behaviour is byte-identical to the original path when disabled.
+    bool  autoRecalibrate = false;
 
     DigitalLineSensors_c() {}
 
@@ -101,6 +130,14 @@ class DigitalLineSensors_c {
       if (index >= 0 && index < 5 && trim > 0.0) gainTrim[index] = trim;
     }
 
+    // Set the online recalibration rates (both 0..1). adaptRate controls how
+    // fast offset/scale move toward the observed range; relaxRate controls how
+    // fast the running min/max decay toward their midpoint. Out-of-range ignored.
+    void setAutoRate(float adaptRate, float relaxRate) {
+      if (adaptRate >= 0.0 && adaptRate <= 1.0) auto_adapt_rate = adaptRate;
+      if (relaxRate >= 0.0 && relaxRate <= 1.0) auto_relax_rate = relaxRate;
+    }
+
     // Copy the current per-sensor offset and scale out to the caller.
     void getCalibration(float outOffset[5], float outScale[5]) {
       for (int i = 0; i < 5; i++) {
@@ -116,6 +153,60 @@ class DigitalLineSensors_c {
         offset[i] = inOffset[i];
         scale[i]  = inScale[i];
       }
+    }
+
+    // Seed the online recalibration extremes from the current calibration, so
+    // enabling autoRecalibrate mid-run does not jump. offset[i] is the stored
+    // min; the stored max is recovered as offset + 1/scale (scale = 1/range).
+    void seedAutoCalibration() {
+      for (int i = 0; i < 5; i++) {
+        auto_min[i] = offset[i];
+        auto_max[i] = (scale[i] > 0.0) ? (offset[i] + 1.0 / scale[i]) : offset[i];
+      }
+      auto_valid = true;
+    }
+
+    // Clear the online recalibration state. The extremes are re-seeded from the
+    // current calibration on the next getCalibrated() when autoRecalibrate is on.
+    void resetAutoCalibration() {
+      auto_valid = false;
+      for (int i = 0; i < 5; i++) {
+        auto_min[i] = 0.0;
+        auto_max[i] = 0.0;
+      }
+    }
+
+    // Update the online recalibration state from the current RAW sensorReadings
+    // and gently move offset/scale toward the observed range. Called only when
+    // autoRecalibrate is true. Expands the running min/max immediately on a new
+    // true extreme, otherwise relaxes them slightly toward their midpoint so a
+    // transient spike does not permanently widen the range.
+    void updateAutoCalibration() {
+
+      if (!auto_valid) seedAutoCalibration();
+
+      for (int i = 0; i < 5; i++) {
+        float raw = (float)sensorReadings[i];
+
+        // Expand immediately on a new true extreme, else relax toward midpoint.
+        if (raw < auto_min[i]) {
+          auto_min[i] = raw;
+        } else if (raw > auto_max[i]) {
+          auto_max[i] = raw;
+        } else {
+          float mid = 0.5 * (auto_min[i] + auto_max[i]);
+          auto_min[i] += auto_relax_rate * (mid - auto_min[i]);
+          auto_max[i] += auto_relax_rate * (mid - auto_max[i]);
+        }
+
+        // Nudge offset/scale toward the observed range. Guard zero range with
+        // the same divide-by-zero pattern used by calibrate().
+        float range = auto_max[i] - auto_min[i];
+        float targetScale = (range > 0.0) ? (1.0 / range) : scale[i];
+        offset[i] += auto_adapt_rate * (auto_min[i] - offset[i]);
+        scale[i]  += auto_adapt_rate * (targetScale - scale[i]);
+      }
+
     }
 
     // Read all sensors in parallel by charging the capacitors HIGH, releasing
@@ -268,6 +359,10 @@ class DigitalLineSensors_c {
     void getCalibrated() {
 
       readAllSensors();
+
+      // Optional online recalibration. Off by default, so with autoRecalibrate
+      // false offset/scale are untouched and outputs are byte-identical.
+      if (autoRecalibrate) updateAutoCalibration();
 
       for (int i = 0; i < 5; i++) {
         float c = ((float)sensorReadings[i] - offset[i]) * scale[i] * gainTrim[i];
