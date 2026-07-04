@@ -26,3 +26,6 @@ Thumbs.db
 
 # Compiled host test binaries
 tests/*.exe
+
+# Compiled sim binaries
+sim/*.exe
