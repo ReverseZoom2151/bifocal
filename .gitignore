@@ -29,3 +29,10 @@ tests/*.exe
 
 # Compiled sim binaries
 sim/*.exe
+
+# Generated sim sweep data and binaries
+sim/sweep_results.csv
+sim/sweepsim
+sim/*.o
+web/*.wasm
+web/*.js

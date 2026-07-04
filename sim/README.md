@@ -28,6 +28,28 @@ trade-off becomes directly measurable.
 The strategy logic (analog / digital / switching with hysteresis + dwell /
 inverse-variance fusion) is replicated from `line_following.ino`.
 
+## Layout
+
+The reusable simulation core lives in `harness.h` (track generation, sensor
+synthesis, the four controllers, rolling variance, metric accumulation) behind a
+single entry point:
+
+```
+bifocal::TrialResult runTrial(const bifocal::Params& p, unsigned int seed);
+```
+
+`Params` carries the knobs a sweep varies (switch margin, switch dwell, PID
+gains, analog/digital noise levels); defaults reproduce the original harness.
+
+- `replay.cpp` is a thin main: it runs one trial with the default parameters and
+  prints the metrics table (output unchanged from the original harness).
+- `sweep.cpp` sweeps the switch margin and dwell (and Kp) across a grid, each
+  cell averaged over a fixed list of seeds (Monte Carlo), and writes
+  `sweep_results.csv` with the mean and standard deviation of `steerRMS` and
+  `IAE`. `analysis/pareto.py` turns that CSV into the Pareto and Monte Carlo
+  figures in `gallery/`. See `docs/parameter-sweep.md` for the full write-up and
+  the recommended (margin, dwell) region.
+
 ## What it does, step by step
 
 1. Ground truth: a sinusoid (gentle curve) plus additive step segments (abrupt
@@ -65,9 +87,10 @@ inverse-variance fusion) is replicated from `line_following.ino`.
 Requires `g++` (C++11) and `make`.
 
 ```
-make        # build
+make        # build the replay harness
 make run    # build and run with the default fixed seed
-make clean  # remove the binary
+make sweep  # build and run the parameter sweep (writes sweep_results.csv)
+make clean  # remove the binaries and the CSV
 ```
 
 Run with a different but still deterministic seed:
