@@ -325,12 +325,14 @@ separation). Re-baseline before comparing new theta values to old runs.
 
 ## Credits and licence
 
+Built by **Tiberiu Toca** and **Ronaldo Balram** (see [AUTHORS](AUTHORS)).
+
 The full write-up is in
 [`docs/variance-based-sensor-switching-paper.pdf`](docs/variance-based-sensor-switching-paper.pdf):
 *Investigating Line-Following Robot Navigation through Variance-Based Sensor
-Switching: A Hybrid Approach to Optimizing Sensor Performance*, by nz20469 and
-xi20942. Encoder and odometry scaffolding and inline guidance credit Paul O'Dowd
-(University of Bristol course material).
+Switching: A Hybrid Approach to Optimizing Sensor Performance* (submitted as
+nz20469 and xi20942). Encoder and odometry scaffolding and inline guidance credit
+Paul O'Dowd (University of Bristol course material).
 
 No licence file is included yet. Add one (for example MIT) if you intend others to
 reuse this code.
