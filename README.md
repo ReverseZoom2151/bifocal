@@ -8,7 +8,7 @@
 ![Board: Pololu 3Pi+ 32U4](https://img.shields.io/badge/board-Pololu%203Pi%2B%2032U4-2A6DB0?style=flat-square)
 ![Language: C++](https://img.shields.io/badge/firmware-C%2B%2B-00599C?style=flat-square&logo=cplusplus&logoColor=white)
 ![Analysis: Jupyter](https://img.shields.io/badge/analysis-Jupyter-F37626?style=flat-square&logo=jupyter&logoColor=white)
-![Paper: PDF](https://img.shields.io/badge/paper-PDF-B31B1B?style=flat-square)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 <img src="gallery/variance_comparison.png" width="460">
 
@@ -25,19 +25,24 @@ The figure above is the main result, computed from the robot's own trial logs.
 Switching cuts the analog array's worst-case noise (its variance on curves drops
 by about 75 percent), but the switching itself adds some heading wobble. That is
 the central trade-off this repository documents: steadier readings, slightly less
-smooth motion.
+smooth motion. The firmware here goes further than the original study: it adds a
+full 5-sensor controller, a debounced switch, an inverse-variance fusion mode,
+optional filtering, clean logging, host tests, and compile CI.
 
 ## Gallery
 
-Every figure is generated from the raw trial CSVs in `data/` by
-[`analysis/make_gallery.py`](analysis/make_gallery.py). No values are entered by
-hand.
+The first three figures come from [`analysis/make_gallery.py`](analysis/make_gallery.py);
+the fourth comes from [`analysis/sensor_noise.py`](analysis/sensor_noise.py). All
+are generated from the raw trial CSVs in `data/`. No values are entered by hand.
 
 <table>
 <tr>
 <td align="center"><img src="gallery/variance_comparison.png" width="300"><br><sub><b>Variance by method</b>: switching removes analog's curve spike and ties digital</sub></td>
 <td align="center"><img src="gallery/theta_stability.png" width="300"><br><sub><b>Heading spread</b>: analog holds the straightest line; switching wobbles (preliminary)</sub></td>
+</tr>
+<tr>
 <td align="center"><img src="gallery/calibration_contrast.png" width="300"><br><sub><b>Calibration contrast</b>: the line reads as a peak on sensor 2; digital's floor is tighter</sub></td>
+<td align="center"><img src="gallery/sensor_noise.png" width="300"><br><sub><b>Middle-sensor noise</b>: sensor 2 is noisiest under switching, inherited from the digital branch</sub></td>
 </tr>
 </table>
 
@@ -72,11 +77,17 @@ array, which is already steady, switching only ties or slightly loses. On the
 thin heading data, the extra switching makes motion visibly less smooth than
 analog alone. Readings get steadier, motion gets a little rougher.
 
-This repository holds the whole project: the refactored firmware that runs the
-three strategies, the raw trial data, the analysis that turns it into the figures
-above, and the [technical paper](docs/variance-based-sensor-switching-paper.pdf)
-that wrote it up. The paper is by nz20469 and xi20942, and the encoder and
-odometry scaffolding follows University of Bristol course material by Paul O'Dowd.
+That result motivated the current firmware. If the per-tick flip-flopping of the
+switch is what costs smoothness, then a debounced switch, an inverse-variance
+blend, a full 5-sensor controller, and optional filtering should each help. All
+of them are implemented here so they can be tried on the robot next.
+
+This repository holds the whole project: the firmware that runs all four
+strategies, the raw trial data, the analysis that turns it into the figures
+above, the host tests and CI, and the
+[technical paper](docs/variance-based-sensor-switching-paper.pdf) that wrote up
+the original study. The encoder and odometry scaffolding follows University of
+Bristol course material by Paul O'Dowd.
 
 ## How it works
 
@@ -84,7 +95,8 @@ The robot reads a 5-element downward-facing IR reflectance array
 (index `0` = left, `2` = middle, `4` = right) in two independent ways.
 
 - **Analog** (`analoglinesensors.h`): `analogRead()` of each phototransistor,
-  averaged over several samples. Higher resolution, more noise.
+  averaged over several samples. Higher resolution, more noise. An optional EMA
+  low-pass filter is available (off by default).
 - **Digital** (`digitallinesensors.h`): charge the sensor capacitor, then time
   its discharge. Longer time means a darker surface. Cleaner contrast, and
   effectively a robust thresholded read.
@@ -93,38 +105,54 @@ Both are normalised to the range 0 to 1 per sensor by a spin-in-place
 **calibration** that captures each sensor's minimum (white) and maximum (black).
 
 **The switch.** Each cycle the firmware computes the average per-sensor variance
-of each array over a short window and picks the steadier one.
+of each array and prefers the steadier one. To stop the selection flip-flopping
+every tick, the switch is debounced: it only changes array when the alternative
+is better by at least `SWITCH_MARGIN`, and never more often than `SWITCH_DWELL_MS`.
 
 ```text
-if (analogVariance < digitalVariance)  use analog
-else                                   use digital
+if (otherVariance + SWITCH_MARGIN < currentVariance
+    and time_since_last_switch >= SWITCH_DWELL_MS)
+    switch arrays
 ```
 
-**Steering.** A weighted term from the mid-left (`1`) and mid-right (`3`) sensors
-drives a differential around a forward bias.
+An alternative to the hard pick is `METHOD_FUSION`, which blends the two arrays'
+line-position errors by inverse variance, so the steadier array simply counts for
+more without a discrete switch.
+
+**Steering.** By default the robot computes a full 5-sensor weighted line
+position (weights -2, -1, 0, 1, 2, normalised to the range -1 to 1). The turn
+term is produced either by a simple proportional law or by a small PID controller
+(`STEER_MODE`). The original 2-sensor measurement (sensors 1 and 3 only) is still
+available behind `USE_FULL_POSITION`.
 
 ```text
-W        = calibrated[3]/(calibrated[1]+calibrated[3]) - calibrated[1]/(...)
-LeftPWM  = BiasPWM + MaxTurnPWM * W
-RightPWM = BiasPWM - MaxTurnPWM * W
+error   = weighted 5-sensor line position, in [-1, 1]
+turn    = error            (simple)   or   PID(error, dt)   (PID)
+LeftPWM  = BiasPWM + MaxTurnPWM * turn
+RightPWM = BiasPWM - MaxTurnPWM * turn
 ```
 
-Wheel-encoder **odometry** (`kinematics.h`) integrates heading (`theta`) so every
-run can be logged and analysed offline.
+Wheel-encoder **odometry** (`kinematics.h`) integrates heading (`theta`). Every
+control tick is written as one timestamped CSV row for offline analysis.
 
 ## Features
 
-- **Three interchangeable strategies**, analog only, digital only, and
-  variance-based switching, selected with one `#define` (`FOLLOW_METHOD`).
-- **Dual sensor pipelines** sharing one physical array, analog `analogRead` and
-  digital RC-decay timing, each with its own calibration and variance.
-- **Variance-based arbitration** using per-sensor variance over a sample window.
-- **Spin-in-place auto-calibration** that normalises every sensor to 0 to 1.
-- **Differential-drive odometry** that logs heading over each trial.
-- **A reproducible analysis pipeline** (`analysis/`) that regenerates every
-  figure in this README from the raw CSVs.
-- **A full experimental dataset**, calibration sweeps and straight and curved
-  trials for all three strategies.
+- **Four interchangeable strategies** selected with one `#define`
+  (`FOLLOW_METHOD`): analog only, digital only, variance-based switching, and
+  inverse-variance fusion.
+- **Full 5-sensor weighted line position** with a simple proportional or PID turn
+  term. The old 2-sensor measurement stays available as a fallback.
+- **Debounced switching** with a hysteresis margin and a minimum dwell time, to
+  stop the per-tick flip-flopping that adds heading wobble.
+- **Inverse-variance fusion** that blends the two arrays instead of hard-picking.
+- **Optional EMA low-pass filter** on calibrated readings, symmetric across both
+  arrays, off by default so the unfiltered pipeline is unchanged.
+- **Configurable odometry geometry** (`setGeometry`) with a standalone
+  calibration sketch and a written procedure.
+- **Clean, fixed-rate, timestamped CSV logging**
+  (`t_ms,theta,method,line_error,var_a,var_d`), one row per control tick.
+- **Host unit tests** and **compile CI** (arduino-cli and PlatformIO).
+- **A reproducible analysis pipeline** and the **full experimental dataset**.
 
 ## Tech stack
 
@@ -170,30 +198,46 @@ arduino-cli compile --fqbn arduino:avr:leonardo firmware/line_following
 arduino-cli upload  --fqbn arduino:avr:leonardo -p COM3 firmware/line_following
 ```
 
+### PlatformIO
+
+```bash
+pio run                 # build the default env
+pio run -t upload       # build and flash
+```
+
 On boot the robot prints `***RESET***`, spins to calibrate, beeps about ten times
-(move it to the start line during this window), then runs a trial and logs
-heading over serial at 9600 baud.
+(move it to the start line during this window), then runs a trial. It logs one
+CSV row per control tick over serial at 9600 baud, starting with a header line
+`t_ms,theta,method,line_error,var_a,var_d`. See
+[docs/build-and-ci.md](docs/build-and-ci.md) for all build paths and caveats.
 
 ## Configuration
 
-Edit the `#define`s at the top of `line_following.ino`.
+Edit the `#define`s at the top of `line_following.ino`. PID gains live in
+`steering.h`.
 
 | Macro | Purpose | Default |
 |-------|---------|---------|
-| `FOLLOW_METHOD` | `METHOD_ANALOG`, `METHOD_DIGITAL`, or `METHOD_SWITCHING` | `METHOD_SWITCHING` |
-| `DEBUG_INSPECT` | `1` streams calibrated readings and variance forever (tuning) | `0` |
+| `FOLLOW_METHOD` | `METHOD_ANALOG`, `METHOD_DIGITAL`, `METHOD_SWITCHING`, or `METHOD_FUSION` | `METHOD_SWITCHING` |
+| `USE_FULL_POSITION` | `1` uses the 5-sensor position, `0` the old 2-sensor measurement | `1` |
+| `STEER_MODE` | `STEER_SIMPLE` (proportional) or `STEER_PID` | `STEER_PID` |
+| `SWITCH_MARGIN` | switching hysteresis: minimum variance advantage to switch arrays | `0.0005` |
+| `SWITCH_DWELL_MS` | switching: minimum time on an array before switching again | `300` |
+| `FUSION_EPS` | inverse-variance guard so a zero variance cannot dominate | `0.0001` |
+| `CONTROL_PERIOD_MS` | control loop period (also the log rate) | `100` |
 | `BiasPWM` | forward bias PWM | `30` |
 | `MaxTurnPWM` | maximum steering differential | `20` |
-| `MAX_RESULTS` | heading samples logged per trial | `80` |
+| `MAX_RESULTS` | logged control ticks per trial | `80` |
 | `ANALOG_STOP_SUM`, `DIGITAL_STOP_SUM` | end-of-line thresholds | `0.4`, `0.1` |
+| `DEBUG_INSPECT` | `1` streams calibrated readings and variance forever (tuning) | `0` |
 
-Switching between the three strategies is a one-line change. This is how the
-three datasets in `data/results/` were produced.
+Switching between strategies is a one-line change to `FOLLOW_METHOD`. This is how
+the datasets in `data/results/` were produced.
 
 ## Experimental method
 
-Each of the three strategies was run over two track types, straight and curve.
-Per run the firmware recorded per-sensor **variance** over time and
+Each of the three original strategies was run over two track types, straight and
+curve. Per run the firmware recorded per-sensor **variance** over time and
 encoder-odometry **heading** (`theta`). Procedure, from the paper: charge the
 battery, place the middle sensor over the line, run the spin calibration, realign
 to the start, then record until the end of the line is detected.
@@ -217,7 +261,9 @@ where the distributions are dominated by rare spikes (see
   already the low-variance baseline. The value of switching is avoiding analog's
   spikes.
 - Noisiest sensor: analog at the edges, digital at index 1, switching at the
-  middle sensor (index 2). Edge sensors are the quietest.
+  middle sensor (index 2). Under switching the middle sensor carries 1.75x to
+  2.34x the side-sensor average, inherited from the digital branch's steep gain
+  there (see [docs/sensor-noise.md](docs/sensor-noise.md)).
 
 **Calibration contrast** (middle sensor, black to white): analog goes 0.99 to
 0.22 (a gap of about 0.77), digital goes 0.99 to 0.08 (a gap of about 0.91), so
@@ -230,7 +276,8 @@ switching run has about three times fewer samples than analog or digital.
 
 **Takeaway.** The variance-based switch improves sensor reliability, but the
 switching itself adds navigation instability. This matches the paper's
-conclusion: an accuracy-versus-smoothness trade-off, not a one-sided win.
+conclusion: an accuracy-versus-smoothness trade-off, not a one-sided win. The
+debounced switch and fusion mode added here target exactly that instability.
 
 ## Reproducing the analysis
 
@@ -238,38 +285,64 @@ conclusion: an accuracy-versus-smoothness trade-off, not a one-sided win.
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install pandas numpy matplotlib seaborn jupyter
 
-python analysis/make_gallery.py        # regenerate the gallery/ figures
+python analysis/make_gallery.py        # regenerate the main gallery figures
+python analysis/sensor_noise.py        # regenerate the middle-sensor figure and stats
 jupyter notebook analysis/RT_Results.ipynb
 ```
 
 `RT_Results.ipynb` loads its combined `theta.csv` and `variances.csv` from a
-remote URL, so it runs without local paths. `make_gallery.py` reads the
-per-scenario CSVs in `data/` directly and defends against the PuTTY headers,
-label rows, and delimiter-free theta dumps in the raw logs.
+remote URL, so it runs without local paths. The two scripts read the per-scenario
+CSVs in `data/` directly and defend against the PuTTY headers, label rows, and
+delimiter-free theta dumps in the raw logs.
+
+## Testing and continuous integration
+
+The pure logic runs and is tested on the host PC, no hardware required.
+
+```bash
+cd tests && make test        # builds and runs all suites under g++ -Wall
+```
+
+The suite stubs the Arduino API (with injectable `analogRead`/`digitalRead`) and
+checks the population-variance formula, the average-variance helper, and the
+differential-drive pose and heading integration. On every push and pull request,
+GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) compiles the
+sketch with both arduino-cli and PlatformIO.
 
 ## Project structure
 
 ```text
 bifocal/
 ├── firmware/
-│   └── line_following/           # Arduino sketch (open this folder in the IDE)
-│       ├── line_following.ino     #   setup(), loop(), strategy dispatch
-│       ├── analoglinesensors.h    #   AnalogLineSensors_c  (analogRead pipeline)
-│       ├── digitallinesensors.h   #   DigitalLineSensors_c (RC decay pipeline)
-│       ├── motors.h               #   Motors_c (PWM and direction)
-│       ├── encoders.h             #   quadrature encoder ISRs (AVR register-level)
-│       └── kinematics.h           #   Kinematics_c (differential-drive odometry)
+│   ├── line_following/            # main Arduino sketch (open this folder in the IDE)
+│   │   ├── line_following.ino      #   setup(), loop(), strategy dispatch, CSV logger
+│   │   ├── steering.h              #   5-sensor line position, 2-sensor fallback, PID_c
+│   │   ├── analoglinesensors.h     #   AnalogLineSensors_c (analogRead pipeline + EMA)
+│   │   ├── digitallinesensors.h    #   DigitalLineSensors_c (RC decay pipeline + EMA)
+│   │   ├── motors.h                #   Motors_c (PWM and direction)
+│   │   ├── encoders.h              #   quadrature encoder ISRs (AVR register-level)
+│   │   └── kinematics.h            #   Kinematics_c (configurable differential-drive odometry)
+│   └── tools/
+│       └── odometry_calibration/   #   standalone sketch to measure wheel geometry
 ├── data/
-│   ├── calibration/              # 8 CSVs: per-sensor readings and variance,
-│   │                             #   analog/digital by black-line/white surface
-│   └── results/                  # 11 CSVs: theta and per-sensor variance for
-│                                 #   analog/digital/switching on straight and curve
+│   ├── calibration/               # 8 CSVs: per-sensor readings and variance
+│   └── results/                   # 11 CSVs: theta and per-sensor variance, all methods
 ├── analysis/
-│   ├── RT_Results.ipynb          # exploratory notebook (pandas, seaborn)
-│   └── make_gallery.py           # regenerates the README figures from data/
-├── gallery/                      # generated result figures (checked in)
+│   ├── RT_Results.ipynb           # exploratory notebook (pandas, seaborn)
+│   ├── make_gallery.py            # regenerates the main gallery figures
+│   └── sensor_noise.py            # middle-sensor noise investigation
+├── tests/                         # host unit tests (stubbed Arduino API, make test)
+├── gallery/                       # generated figures (checked in)
 ├── docs/
-│   └── variance-based-sensor-switching-paper.pdf   # the technical paper
+│   ├── variance-based-sensor-switching-paper.pdf
+│   ├── odometry-calibration.md
+│   ├── sensor-noise.md
+│   └── build-and-ci.md
+├── assets/logos/                  # tech-stack logos used by this README
+├── .github/workflows/ci.yml       # compile CI (arduino-cli + PlatformIO)
+├── platformio.ini
+├── AUTHORS
+├── LICENSE
 └── README.md
 ```
 
@@ -278,43 +351,46 @@ duplicated copy of the firmware and its zip were cleaned up.
 
 ## Known limitations
 
+These describe the existing dataset in `data/`. The new firmware logger addresses
+the format issues (2 and 3) for any runs collected from now on.
+
 1. **Thin heading data.** Theta logs are short and uneven, and switching has
    about three times fewer samples, so the smoothness numbers are indicative
    rather than statistically robust.
-2. **Accumulating serial dumps.** The theta logger reprints its whole history on
-   each line with no delimiters, so the analysis takes the longest run per file.
+2. **Accumulating serial dumps.** The old theta logger reprinted its whole
+   history on each line with no delimiters, so the analysis takes the longest run
+   per file. The new logger emits one clean timestamped row per tick instead.
 3. **PuTTY log headers** are embedded in several CSVs and must be stripped.
 4. **The `-1.00` sentinel** appears in the switching theta log. Confirm its
    meaning against the firmware before treating those rows as data.
 5. **Outlier-dominated means.** Variance means are skewed by rare spikes, so the
    conclusions lean on medians.
-6. **Two-sensor steering.** Steering uses only sensors 1 and 3.
 
-## Roadmap
+## Status
 
-**Controller.** Use a full 5-sensor weighted position (or a PID), debounce the
-switch with hysteresis or a minimum dwell time (the likely source of the wobble),
-or fuse the two arrays by inverse-variance weight instead of a hard pick.
+The original study's roadmap is now implemented in firmware and tooling:
 
-**Sensing.** Add a low-pass filter on calibrated readings, and investigate why
-the middle sensor is noisiest under switching.
+- **Controller.** Full 5-sensor weighted position and a PID option; a debounced
+  switch (hysteresis plus dwell); and an inverse-variance fusion mode.
+- **Sensing.** An optional EMA low-pass filter on calibrated readings, and a
+  written investigation of the noisy middle sensor
+  ([docs/sensor-noise.md](docs/sensor-noise.md)).
+- **Odometry.** Configurable wheel geometry with a calibration helper sketch and
+  procedure ([docs/odometry-calibration.md](docs/odometry-calibration.md)). The
+  heading formula was corrected during the refactor.
+- **Data.** Clean, fixed-rate, timestamped CSV logging.
+- **Tooling.** A PlatformIO project, compile CI, and host unit tests.
 
-**Odometry.** Calibrate `wheelRadius`, `wheelSeparation`, and
-`encoderCountsPerRevolution` against ground truth. The heading formula was
-corrected in this refactor.
+Still open, because it needs the physical robot: tune the PID gains and the
+switch margin and dwell on the track, and collect more and longer runs
+(especially for switching and fusion) to make the heading-smoothness comparison
+statistically solid.
 
-**Data.** Log with timestamps and a fixed sample rate, emit clean CSV, and
-collect more and longer runs, especially for switching.
+## Firmware fixes in the refactor
 
-**Tooling.** Add a PlatformIO project or a CI `arduino-cli compile` check, and
-host-side unit tests for the pure logic. A stubbed Arduino API already
-syntax-verifies the headers under `g++ -Wall -Wextra`.
-
-## Firmware fixes in this refactor
-
-The core algorithm's behaviour is preserved. These changes remove real bugs and
-undefined behaviour. In short: added the missing `motors.initialise()`, removed a
-stray brace and an always-on `while(true)` block that stranded `loop()`, made
+The core algorithm's behaviour was preserved. These changes removed real bugs and
+undefined behaviour: added the missing `motors.initialise()`, removed a stray
+brace and an always-on `while(true)` block that stranded `loop()`, made
 `calculateVariance()` actually return, replaced variable-length arrays with fixed
 ones, fixed the analog sampling loop that discarded all but the last sample, made
 analog and digital average-variance consistent so the switch compares like with
@@ -334,5 +410,4 @@ Switching: A Hybrid Approach to Optimizing Sensor Performance* (submitted as
 nz20469 and xi20942). Encoder and odometry scaffolding and inline guidance credit
 Paul O'Dowd (University of Bristol course material).
 
-No licence file is included yet. Add one (for example MIT) if you intend others to
-reuse this code.
+Released under the [MIT License](LICENSE).
